@@ -1,208 +1,203 @@
 from flask import Flask, jsonify, request
-from flask_cors import CORS
-import pyodbc
-import random
+import mysql.connector
 from datetime import datetime
+from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CẤU HÌNH KẾT NỐI (Giữ nguyên thông tin của bạn) ---
 def get_db_connection():
-    server = 'LAPTOP-UJO9PM00\\SQLEXPRESS' 
-    database = 'E_COMMERCE'
-    conn_str = (
-        f'DRIVER={{ODBC Driver 17 for SQL Server}};'
-        f'SERVER={server};'
-        f'DATABASE={database};'
-        f'Trusted_Connection=yes;'
-        f'Encrypt=yes;'
-        f'TrustServerCertificate=yes;'
-    )
-    return pyodbc.connect(conn_str)
+    try:
+        connection = mysql.connector.connect(
+            host='localhost',
+            port=3306,
+            user='student_dev',      
+            password='123456',       
+            database='EcommerceDB'
+        )
+        return connection
+    except mysql.connector.Error as err:
+        print(f"Lỗi kết nối DB: {err}")
+        return None
 
 def rows_to_dict(cursor, rows):
+    if not rows: return []
     columns = [column[0] for column in cursor.description]
     results = []
     for row in rows:
         results.append(dict(zip(columns, row)))
     return results
 
-# --- API 1: Lấy danh sách (READ) ---
+# --- API 1: Lấy danh sách sản phẩm ---
 @app.route('/api/products', methods=['GET'])
 def get_products():
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Không thể kết nối Database.'}), 500
+    
     try:
-        conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("""
             SELECT 
                 Product_ID as id, 
                 Name as name, 
-                OriginalPrice as originalPrice, 
+                Original_Price as originalPrice, 
                 StockQuantity as stock,
                 Description as description
             FROM Product
+            ORDER BY Product_ID DESC -- Sắp xếp để thấy SP mới nhất lên đầu
         """)
         rows = cursor.fetchall()
         products = rows_to_dict(cursor, rows)
-        conn.close()
         return jsonify(products)
     except Exception as e:
-        print("Lỗi Get:", e)
         return jsonify({'error': str(e)}), 500
-# --- API 2: Báo cáo Doanh thu cao (Đã cập nhật gọi SP) ---
+    finally:
+        conn.close()
+
 @app.route('/api/reports/high-revenue', methods=['GET'])
 def get_high_revenue_report():
+    year = request.args.get('year', 2025)
+    min_revenue = request.args.get('min_revenue', 0)
+    
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Database connect failed'}), 500
+    
     try:
-        # Lấy tham số từ URL
-        year = request.args.get('year', 2025)
-        min_revenue = request.args.get('min_revenue', 0)
-        
-        conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Gọi Stored Procedure sp_GetHighRevenueShops
-        # Tham số: @ReportYear, @MinRevenue
-        cursor.execute("{CALL sp_GetHighRevenueShops (?, ?)}", (year, float(min_revenue)))
+        cursor.execute("CALL sp_GetHighRevenueShops(%s, %s)", (year, float(min_revenue)))
         
         rows = cursor.fetchall()
+        report_data = rows_to_dict(cursor, rows)
         
-        # Map dữ liệu trả về cho Frontend
-        report_data = []
-        columns = [column[0] for column in cursor.description]
+        # Dọn dẹp result set (nếu có)
+        while cursor.nextset(): pass
         
-        for row in rows:
-            item = dict(zip(columns, row))
-            report_data.append({
-                'shopId': item['Shop_ID'],
-                'shopName': item['ShopName'],
-                'totalOrders': item['TotalOrders'],
-                'totalRevenue': item['TotalRevenue']
-            })
-            
-        conn.close()
         return jsonify(report_data)
     except Exception as e:
         print("Lỗi Report:", e)
         return jsonify({'error': str(e)}), 500
-# --- API 3: Thêm mới (INSERT) ---
+    finally:
+        conn.close()
+
 @app.route('/api/products', methods=['POST'])
 def add_product():
+    data = request.json
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Database connect failed'}), 500
+
     try:
-        data = request.json
-        conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 1. Tạo ID là số nguyên (INT) thay vì chuỗi "PRD..."
-        new_id = random.randint(1000, 999999)
-        
-        # 2. Lấy thời gian hiện tại cho CreateAt
-        create_at = datetime.now()
-        
-        # 3. Gán Shop ID mặc định là 201 (Phải đảm bảo bảng Shop có ID=201)
-        shop_id = 201
-        
-        # 4. Gọi Procedure theo ĐÚNG thứ tự tham số trong SQL bạn gửi:
-        # @p_product_id, @p_stockquantity, @p_createat, @p_description, @p_name, @p_original_price, @p_shop_id
-        cursor.execute("{CALL sp_InsertProduct (?, ?, ?, ?, ?, ?, ?)}", (
-            new_id,                 # @p_product_id (INT)
-            int(data['stock']),     # @p_stockquantity (INT)
-            create_at,              # @p_createat (DATE)
-            data.get('description', ''), # @p_description
-            data['name'],           # @p_name
-            float(data['originalPrice']), # @p_original_price
-            shop_id                 # @p_shop_id (INT)
+        # 1. Không cần random ID nữa
+        create_at = datetime.now().strftime('%Y-%m-%d') 
+        shop_id = 1 
+
+        # 2. Gọi SP Insert (Chỉ còn 6 tham số, bỏ p_id)
+        cursor.execute("CALL sp_InsertProduct(%s, %s, %s, %s, %s, %s)", (
+            int(data['stock']),
+            create_at,
+            data.get('description', ''),
+            data['name'],
+            float(data['originalPrice']),
+            shop_id
         ))
         
+        # 3. Lấy ID tự động tăng
+        new_row = cursor.fetchone()
+        if new_row:
+            new_id = new_row[0]
+        else:
+            new_id = None
+
+        # 4. QUAN TRỌNG: Dọn sạch các result set còn lại để tránh lỗi "Commands out of sync"
+        while cursor.nextset():
+            pass
+
         conn.commit()
-        conn.close()
         return jsonify({'message': 'Thêm thành công!', 'new_id': new_id}), 201
     except Exception as e:
         print("Lỗi Insert:", e)
-        # Trả về lỗi chi tiết để hiển thị lên frontend
         return jsonify({'error': str(e)}), 500
-# --- API 4: Xóa (DELETE) ---
-@app.route('/api/products/<int:id>', methods=['DELETE']) # Lưu ý: <int:id>
-def delete_product(id):
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Gọi sp_DeleteProduct chỉ cần 1 tham số
-        cursor.execute("{CALL sp_DeleteProduct (?)}", (id,))
-        
-        conn.commit()
+    finally:
         conn.close()
+
+@app.route('/api/products/<int:id>', methods=['DELETE'])
+def delete_product(id):
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Connection failed'}), 500
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("CALL sp_DeleteProduct(%s)", (id,))
+        conn.commit()
         return jsonify({'message': 'Xóa thành công!'}), 200
     except Exception as e:
-        print("Lỗi Delete:", e)
         return jsonify({'error': str(e)}), 500
-# --- API 5: Sửa (UPDATE) ---
-@app.route('/api/products/<int:id>', methods=['PUT']) # Lưu ý: <int:id>
-def update_product(id):
-    try:
-        data = request.json
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        shop_id = 201 # Mặc định
-        
-        # Thứ tự tham số trong sp_UpdateProduct của bạn:
-        # @p_product_id, @p_stockquantity, @p_description, @p_name, @p_original_price, @p_shop_id
-        cursor.execute("{CALL sp_UpdateProduct (?, ?, ?, ?, ?, ?)}", (
-            id,                     # @p_product_id
-            int(data['stock']),     # @p_stockquantity
-            data.get('description', ''), # @p_description
-            data['name'],           # @p_name
-            float(data['originalPrice']), # @p_original_price
-            shop_id                 # @p_shop_id
-        ))
-        
-        conn.commit()
+    finally:
         conn.close()
+
+@app.route('/api/products/<int:id>', methods=['PUT'])
+def update_product(id):
+    data = request.json
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Connection failed'}), 500
+    
+    try:
+        cursor = conn.cursor()
+        shop_id = 1 
+        
+        cursor.execute("CALL sp_UpdateProduct(%s, %s, %s, %s, %s, %s)", (
+            id,
+            int(data['stock']),
+            data.get('description', ''),
+            data['name'],
+            float(data['originalPrice']),
+            shop_id
+        ))
+        conn.commit()
         return jsonify({'message': 'Cập nhật thành công!'}), 200
     except Exception as e:
         print("Lỗi Update:", e)
         return jsonify({'error': str(e)}), 500
-# --- API 6: Tìm kiếm sản phẩm (SEARCH) ---
+    finally:
+        conn.close()
+
+# --- API 6: Tìm kiếm (SEARCH via SP) ---
 @app.route('/api/products/search', methods=['GET'])
 def search_products():
+    keyword = request.args.get('keyword', '')
+    max_price = request.args.get('max_price', 2000000000)
+    
+    conn = get_db_connection()
+    if not conn: return jsonify({'error': 'Connection failed'}), 500
+    
     try:
-        # Lấy tham số từ URL
-        keyword = request.args.get('keyword', '')
-        max_price = request.args.get('max_price', 2000000000) # Nếu không nhập thì lấy số rất lớn
-        
-        conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # Gọi Stored Procedure sp_SearchProducts
-        cursor.execute("{CALL sp_SearchProducts (?, ?)}", (keyword, int(max_price)))
-        
+        cursor.execute("CALL sp_SearchProducts(%s, %s)", (keyword, int(max_price)))
         rows = cursor.fetchall()
         
-        # Map dữ liệu trả về cho khớp với Frontend
-        # Frontend cần: id, name, originalPrice, stock, description
         products = []
-        columns = [column[0] for column in cursor.description]
+        if rows:
+            columns = [col[0] for col in cursor.description]
+            for row in rows:
+                item = dict(zip(columns, row))
+                products.append({
+                    'id': item['Product_ID'],
+                    'name': item['ProductName'],
+                    'originalPrice': item['OriginalPrice'],
+                    'stock': item['StockQuantity'],
+                    'description': item['Description']
+                })
         
-        for row in rows:
-            item = dict(zip(columns, row))
-            # Chuyển đổi key của Dictionary cho khớp với React
-            products.append({
-                'id': item['Product_ID'],
-                'name': item['ProductName'],         # SP trả về ProductName
-                'originalPrice': item['OriginalPrice'],
-                'stock': item['StockQuantity'],
-                'description': item['Description']
-                # Bạn có thể thêm shopName, shopRating nếu muốn hiển thị thêm
-            })
-            
-        conn.close()
+        # Dọn dẹp result set cho chắc chắn
+        while cursor.nextset(): pass
+
         return jsonify(products)
     except Exception as e:
         print("Lỗi Search:", e)
         return jsonify({'error': str(e)}), 500
-
+    finally:
+        conn.close()
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
